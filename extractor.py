@@ -1,0 +1,282 @@
+from __future__ import annotations
+
+import json
+import re
+from datetime import datetime, timezone
+
+import aiosqlite
+
+SQL_TABLES = """
+CREATE TABLE IF NOT EXISTS subscriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    service_name TEXT NOT NULL,
+    amount REAL NOT NULL DEFAULT 0,
+    currency TEXT NOT NULL DEFAULT 'USD',
+    billing_cycle TEXT NOT NULL DEFAULT 'monthly',
+    category TEXT NOT NULL DEFAULT 'other',
+    status TEXT NOT NULL DEFAULT 'active',
+    detected_from TEXT NOT NULL DEFAULT 'email',
+    last_billed TEXT,
+    next_billing TEXT,
+    price_history TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subscription_id INTEGER NOT NULL,
+    alert_type TEXT NOT NULL,
+    message TEXT NOT NULL,
+    old_value TEXT,
+    new_value TEXT,
+    is_read INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (subscription_id) REFERENCES subscriptions(id)
+);
+"""
+
+# Known subscription services and their patterns
+SERVICE_PATTERNS = [
+    (r"netflix", "Netflix", "streaming", "monthly"),
+    (r"spotify", "Spotify", "streaming", "monthly"),
+    (r"apple\s*(?:one|music|tv\+|icloud)", "Apple Services", "streaming", "monthly"),
+    (r"amazon\s*(?:prime|aws)", "Amazon", "cloud", "monthly"),
+    (r"google\s*(?:one|workspace|cloud)", "Google", "cloud", "monthly"),
+    (r"microsoft\s*(?:365|azure|office)", "Microsoft", "saas", "monthly"),
+    (r"dropbox", "Dropbox", "cloud", "monthly"),
+    (r"github", "GitHub", "saas", "monthly"),
+    (r"notion", "Notion", "saas", "monthly"),
+    (r"slack", "Slack", "saas", "monthly"),
+    (r"zoom", "Zoom", "saas", "monthly"),
+    (r"figma", "Figma", "saas", "monthly"),
+    (r"linear", "Linear", "saas", "monthly"),
+    (r"vercel", "Vercel", "cloud", "monthly"),
+    (r"heroku", "Heroku", "cloud", "monthly"),
+    (r"digitalocean", "DigitalOcean", "cloud", "monthly"),
+    (r"openai", "OpenAI", "saas", "monthly"),
+    (r"anthropic", "Anthropic", "saas", "monthly"),
+    (r"hubspot", "HubSpot", "marketing", "monthly"),
+    (r"mailchimp", "Mailchimp", "marketing", "monthly"),
+    (r"stripe", "Stripe", "finance", "monthly"),
+    (r"quickbooks", "QuickBooks", "finance", "monthly"),
+    (r"adobe", "Adobe", "saas", "monthly"),
+    (r"canva", "Canva", "saas", "monthly"),
+    (r"loom", "Loom", "saas", "monthly"),
+    (r"airtable", "Airtable", "saas", "monthly"),
+]
+
+AMOUNT_PATTERN = re.compile(
+    r"(?:charged|billed|payment|invoice|receipt|total|amount)[^\$£€\d]*"
+    r"(?P<currency>[\$£€]|USD|EUR|GBP)?\s*(?P<amount>\d+(?:[.,]\d{1,2})?)",
+    re.IGNORECASE,
+)
+GENERIC_AMOUNT_PATTERN = re.compile(r"(?P<currency>[\$£€])\s*(?P<amount>\d+(?:[.,]\d{1,2})?)")
+
+DATE_PATTERN = re.compile(
+    r"(?:date|billed on|charged on|next billing)[:\s]+([A-Za-z]+ \d{1,2},? \d{4}|\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})",
+    re.IGNORECASE,
+)
+TRIAL_PATTERN = re.compile(r"trial|free\s+(?:month|period|trial)", re.IGNORECASE)
+CANCEL_PATTERN = re.compile(r"cancell?ed|subscription\s+ended|no longer\s+active", re.IGNORECASE)
+YEARLY_PATTERN = re.compile(r"annual|yearly|per\s+year|\/year", re.IGNORECASE)
+
+
+def extract_subscription(email_text: str) -> dict | None:
+    """Extract subscription info from a raw email body."""
+    lower = email_text.lower()
+
+    # Match known service
+    service_name = None
+    category = "other"
+    default_cycle = "monthly"
+    for pattern, name, cat, cycle in SERVICE_PATTERNS:
+        if re.search(pattern, lower):
+            service_name = name
+            category = cat
+            default_cycle = cycle
+            break
+
+    if not service_name:
+        # Try generic: look for "receipt", "invoice", "subscription" keywords
+        if not any(kw in lower for kw in ["receipt", "invoice", "subscription", "billing", "payment", "charged"]):
+            return None
+        # Extract company from "from" line or subject
+        match = re.search(r"from\s*([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)", email_text)
+        service_name = match.group(1) if match else "Unknown Service"
+
+    # Extract amount
+    amount = 0.0
+    currency = "USD"
+    for pat in [AMOUNT_PATTERN, GENERIC_AMOUNT_PATTERN]:
+        m = pat.search(email_text)
+        if m:
+            raw = m.group("amount").replace(",", ".")
+            try:
+                amount = float(raw)
+            except ValueError:
+                pass
+            cur = m.group("currency") or "USD"
+            currency = {"$": "USD", "£": "GBP", "€": "EUR"}.get(cur, cur)
+            break
+
+    # Determine billing cycle
+    billing_cycle = "yearly" if YEARLY_PATTERN.search(email_text) else default_cycle
+
+    # Determine status
+    if CANCEL_PATTERN.search(email_text):
+        status = "cancelled"
+    elif TRIAL_PATTERN.search(email_text):
+        status = "trial"
+    else:
+        status = "active"
+
+    # Extract date
+    date_match = DATE_PATTERN.search(email_text)
+    last_billed = date_match.group(1) if date_match else None
+
+    return {
+        "service_name": service_name,
+        "amount": amount,
+        "currency": currency,
+        "billing_cycle": billing_cycle,
+        "category": category,
+        "status": status,
+        "last_billed": last_billed,
+    }
+
+
+async def init_db(path: str) -> aiosqlite.Connection:
+    db = await aiosqlite.connect(path)
+    db.row_factory = aiosqlite.Row
+    await db.executescript(SQL_TABLES)
+    await db.commit()
+    return db
+
+
+async def import_emails(db: aiosqlite.Connection, emails: list[str]) -> list[dict]:
+    """Process a list of email bodies and upsert subscriptions."""
+    now = datetime.now(timezone.utc).isoformat()
+    results = []
+
+    for email_text in emails:
+        extracted = extract_subscription(email_text)
+        if not extracted:
+            continue
+
+        # Check if subscription already exists
+        existing = await db.execute_fetchall(
+            "SELECT * FROM subscriptions WHERE service_name = ?",
+            (extracted["service_name"],),
+        )
+
+        if existing:
+            row = existing[0]
+            # Detect price change → alert
+            if row["amount"] != extracted["amount"] and extracted["amount"] > 0:
+                old_price = f'{row["currency"]} {row["amount"]}'
+                new_price = f'{extracted["currency"]} {extracted["amount"]}'
+                await db.execute(
+                    "INSERT INTO alerts (subscription_id, alert_type, message, old_value, new_value, created_at) VALUES (?, 'price_change', ?, ?, ?, ?)",
+                    (row["id"], f'{extracted["service_name"]} changed price: {old_price} → {new_price}', old_price, new_price, now),
+                )
+                history = json.loads(row["price_history"])
+                history.append({"date": now, "amount": extracted["amount"], "currency": extracted["currency"]})
+                await db.execute(
+                    "UPDATE subscriptions SET amount=?, last_billed=?, price_history=? WHERE id=?",
+                    (extracted["amount"], extracted["last_billed"] or row["last_billed"], json.dumps(history), row["id"]),
+                )
+            results.append(dict(row))
+        else:
+            cur = await db.execute(
+                "INSERT INTO subscriptions (service_name, amount, currency, billing_cycle, category, status, detected_from, last_billed, price_history, created_at) VALUES (?, ?, ?, ?, ?, ?, 'email', ?, '[]', ?)",
+                (extracted["service_name"], extracted["amount"], extracted["currency"],
+                 extracted["billing_cycle"], extracted["category"], extracted["status"],
+                 extracted["last_billed"], now),
+            )
+            row = await db.execute_fetchall("SELECT * FROM subscriptions WHERE id=?", (cur.lastrowid,))
+            results.append(dict(row[0]))
+
+    await db.commit()
+    return results
+
+
+async def list_subscriptions(db: aiosqlite.Connection, status: str | None = None, category: str | None = None) -> list[dict]:
+    q = "SELECT * FROM subscriptions"
+    params: list = []
+    conditions = []
+    if status:
+        conditions.append("status = ?")
+        params.append(status)
+    if category:
+        conditions.append("category = ?")
+        params.append(category)
+    if conditions:
+        q += " WHERE " + " AND ".join(conditions)
+    q += " ORDER BY amount DESC"
+    rows = await db.execute_fetchall(q, params)
+    return [_sub_row(r) for r in rows]
+
+
+async def get_spending_summary(db: aiosqlite.Connection) -> dict:
+    rows = await db.execute_fetchall("SELECT * FROM subscriptions WHERE status = 'active'")
+    total_monthly = 0.0
+    total_yearly = 0.0
+    by_cat: dict[str, float] = {}
+    top: list[dict] = []
+
+    for r in rows:
+        monthly = r["amount"] if r["billing_cycle"] == "monthly" else r["amount"] / 12
+        yearly = r["amount"] * 12 if r["billing_cycle"] == "monthly" else r["amount"]
+        total_monthly += monthly
+        total_yearly += yearly
+        by_cat[r["category"]] = by_cat.get(r["category"], 0) + monthly
+        top.append({"name": r["service_name"], "monthly": round(monthly, 2), "category": r["category"]})
+
+    top.sort(key=lambda x: x["monthly"], reverse=True)
+    trial_count = len(await db.execute_fetchall("SELECT id FROM subscriptions WHERE status='trial'"))
+
+    return {
+        "total_monthly": round(total_monthly, 2),
+        "total_yearly": round(total_yearly, 2),
+        "currency": "USD",
+        "by_category": {k: round(v, 2) for k, v in by_cat.items()},
+        "active_count": len(rows),
+        "trial_count": trial_count,
+        "top_subscriptions": top[:10],
+    }
+
+
+async def list_alerts(db: aiosqlite.Connection, unread_only: bool = False) -> list[dict]:
+    q = "SELECT a.*, s.service_name FROM alerts a JOIN subscriptions s ON a.subscription_id = s.id"
+    if unread_only:
+        q += " WHERE a.is_read = 0"
+    q += " ORDER BY a.created_at DESC"
+    rows = await db.execute_fetchall(q)
+    return [_alert_row(r) for r in rows]
+
+
+async def mark_alert_read(db: aiosqlite.Connection, alert_id: int) -> bool:
+    await db.execute("UPDATE alerts SET is_read = 1 WHERE id = ?", (alert_id,))
+    await db.commit()
+    return True
+
+
+def _sub_row(r) -> dict:
+    return {
+        "id": r["id"], "service_name": r["service_name"],
+        "amount": r["amount"], "currency": r["currency"],
+        "billing_cycle": r["billing_cycle"], "category": r["category"],
+        "status": r["status"], "detected_from": r["detected_from"],
+        "last_billed": r["last_billed"], "next_billing": r["next_billing"],
+        "price_history": json.loads(r["price_history"]), "created_at": r["created_at"],
+    }
+
+
+def _alert_row(r) -> dict:
+    return {
+        "id": r["id"], "subscription_id": r["subscription_id"],
+        "service_name": r["service_name"], "alert_type": r["alert_type"],
+        "message": r["message"], "old_value": r["old_value"],
+        "new_value": r["new_value"], "created_at": r["created_at"],
+        "is_read": bool(r["is_read"]),
+    }
