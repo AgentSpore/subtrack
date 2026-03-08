@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import aiosqlite
 
@@ -80,6 +80,44 @@ TRIAL_PATTERN = re.compile(r"trial|free\s+(?:month|period|trial)", re.IGNORECASE
 CANCEL_PATTERN = re.compile(r"cancell?ed|subscription\s+ended|no longer\s+active", re.IGNORECASE)
 YEARLY_PATTERN = re.compile(r"annual|yearly|per\s+year|\/year", re.IGNORECASE)
 
+_DATE_FMTS = [
+    "%B %d, %Y", "%B %d %Y", "%b %d, %Y", "%b %d %Y",
+    "%m/%d/%Y", "%m-%d-%Y", "%d/%m/%Y", "%d-%m-%Y",
+    "%m/%d/%y", "%m-%d-%y",
+]
+
+
+def _parse_date(date_str: str) -> datetime | None:
+    for fmt in _DATE_FMTS:
+        try:
+            return datetime.strptime(date_str.strip(), fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _compute_next_billing(last_billed: str | None, billing_cycle: str) -> str | None:
+    """Compute next billing date from last_billed + cycle."""
+    base = _parse_date(last_billed) if last_billed else datetime.now(timezone.utc)
+    if base is None:
+        base = datetime.now(timezone.utc)
+    if billing_cycle == "yearly":
+        try:
+            nxt = base.replace(year=base.year + 1)
+        except ValueError:
+            nxt = base + timedelta(days=365)
+    elif billing_cycle == "weekly":
+        nxt = base + timedelta(weeks=1)
+    else:  # monthly
+        month = base.month + 1
+        year = base.year + (month - 1) // 12
+        month = ((month - 1) % 12) + 1
+        try:
+            nxt = base.replace(year=year, month=month)
+        except ValueError:
+            nxt = base.replace(year=year, month=month, day=28)
+    return nxt.strftime("%Y-%m-%d")
+
 
 def extract_subscription(email_text: str) -> dict | None:
     """Extract subscription info from a raw email body."""
@@ -133,6 +171,7 @@ def extract_subscription(email_text: str) -> dict | None:
     # Extract date
     date_match = DATE_PATTERN.search(email_text)
     last_billed = date_match.group(1) if date_match else None
+    next_billing = _compute_next_billing(last_billed, billing_cycle)
 
     return {
         "service_name": service_name,
@@ -142,6 +181,7 @@ def extract_subscription(email_text: str) -> dict | None:
         "category": category,
         "status": status,
         "last_billed": last_billed,
+        "next_billing": next_billing,
     }
 
 
@@ -188,10 +228,10 @@ async def import_emails(db: aiosqlite.Connection, emails: list[str]) -> list[dic
             results.append(dict(row))
         else:
             cur = await db.execute(
-                "INSERT INTO subscriptions (service_name, amount, currency, billing_cycle, category, status, detected_from, last_billed, price_history, created_at) VALUES (?, ?, ?, ?, ?, ?, 'email', ?, '[]', ?)",
+                "INSERT INTO subscriptions (service_name, amount, currency, billing_cycle, category, status, detected_from, last_billed, next_billing, price_history, created_at) VALUES (?, ?, ?, ?, ?, ?, 'email', ?, ?, '[]', ?)",
                 (extracted["service_name"], extracted["amount"], extracted["currency"],
                  extracted["billing_cycle"], extracted["category"], extracted["status"],
-                 extracted["last_billed"], now),
+                 extracted["last_billed"], extracted.get("next_billing"), now),
             )
             row = await db.execute_fetchall("SELECT * FROM subscriptions WHERE id=?", (cur.lastrowid,))
             results.append(dict(row[0]))
@@ -212,7 +252,7 @@ async def list_subscriptions(db: aiosqlite.Connection, status: str | None = None
         params.append(category)
     if conditions:
         q += " WHERE " + " AND ".join(conditions)
-    q += " ORDER BY amount DESC"
+    q += " ORDER BY next_billing ASC NULLS LAST"
     rows = await db.execute_fetchall(q, params)
     return [_sub_row(r) for r in rows]
 
