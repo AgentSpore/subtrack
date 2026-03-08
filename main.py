@@ -11,6 +11,7 @@ from models import EmailImport, SubscriptionResponse, SpendingSummary, AlertResp
 from extractor import (
     init_db, import_emails, list_subscriptions,
     get_spending_summary, list_alerts, mark_alert_read,
+    delete_subscription,
 )
 
 DB_PATH = "subtrack.db"
@@ -26,18 +27,14 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="SubTrack",
     description="AI-powered subscription tracker. Paste billing emails, get a full picture of your recurring spend. Alerts on price increases — no bank connection needed.",
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
 
 
 @app.post("/subscriptions/import", response_model=list[SubscriptionResponse])
 async def import_billing_emails(body: EmailImport):
-    """
-    Scan raw email bodies for subscription billing info.
-    AI extracts: service name, amount, cycle, category, status.
-    Detects price changes and creates alerts automatically.
-    """
+    """Scan raw email bodies for subscription billing info."""
     results = await import_emails(app.state.db, body.emails)
     if not results:
         raise HTTPException(422, "No subscription data found in provided emails")
@@ -62,16 +59,12 @@ async def export_subscriptions_csv(
     subs = await list_subscriptions(app.state.db, status, category)
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow([
-        "service_name", "amount", "currency", "billing_cycle",
-        "category", "status", "last_billed", "next_billing",
-    ])
+    writer.writerow(["service_name", "amount", "currency", "billing_cycle",
+                     "category", "status", "last_billed", "next_billing"])
     for s in subs:
-        writer.writerow([
-            s["service_name"], s["amount"], s["currency"],
-            s["billing_cycle"], s["category"], s["status"],
-            s.get("last_billed", ""), s.get("next_billing", ""),
-        ])
+        writer.writerow([s["service_name"], s["amount"], s["currency"],
+                         s["billing_cycle"], s["category"], s["status"],
+                         s.get("last_billed", ""), s.get("next_billing", "")])
     buf.seek(0)
     return StreamingResponse(
         iter([buf.getvalue()]),
@@ -80,12 +73,17 @@ async def export_subscriptions_csv(
     )
 
 
+@app.delete("/subscriptions/{subscription_id}", status_code=204)
+async def remove_subscription(subscription_id: int):
+    """Delete a subscription and all its associated alerts."""
+    ok = await delete_subscription(app.state.db, subscription_id)
+    if not ok:
+        raise HTTPException(404, "Subscription not found")
+
+
 @app.get("/spending/summary", response_model=SpendingSummary)
 async def spending_summary():
-    """
-    Aggregated spend analytics: monthly/yearly totals, breakdown by category,
-    active vs trial count, top subscriptions by cost.
-    """
+    """Aggregated spend analytics: monthly/yearly totals, breakdown by category."""
     return await get_spending_summary(app.state.db)
 
 
