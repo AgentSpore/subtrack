@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import csv
+import io
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import StreamingResponse
 
 from models import EmailImport, SubscriptionResponse, SpendingSummary, AlertResponse
 from extractor import (
@@ -23,7 +26,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="SubTrack",
     description="AI-powered subscription tracker. Paste billing emails, get a full picture of your recurring spend. Alerts on price increases — no bank connection needed.",
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
@@ -48,6 +51,33 @@ async def index_subscriptions(
 ):
     """List all detected subscriptions with optional filters."""
     return await list_subscriptions(app.state.db, status, category)
+
+
+@app.get("/subscriptions/export/csv")
+async def export_subscriptions_csv(
+    status: str | None = Query(None),
+    category: str | None = Query(None),
+):
+    """Export subscriptions as CSV file for spreadsheets or accounting."""
+    subs = await list_subscriptions(app.state.db, status, category)
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow([
+        "service_name", "amount", "currency", "billing_cycle",
+        "category", "status", "last_billed", "next_billing",
+    ])
+    for s in subs:
+        writer.writerow([
+            s["service_name"], s["amount"], s["currency"],
+            s["billing_cycle"], s["category"], s["status"],
+            s.get("last_billed", ""), s.get("next_billing", ""),
+        ])
+    buf.seek(0)
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=subscriptions.csv"},
+    )
 
 
 @app.get("/spending/summary", response_model=SpendingSummary)
