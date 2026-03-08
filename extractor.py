@@ -320,3 +320,11 @@ def _alert_row(r) -> dict:
         "new_value": r["new_value"], "created_at": r["created_at"],
         "is_read": bool(r["is_read"]),
     }
+
+async def delete_subscription(db: aiosqlite.Connection, subscription_id: int) -> bool:
+    """Delete a subscription and its associated alerts."""
+    await db.execute("DELETE FROM alerts WHERE subscription_id = ?", (subscription_id,))
+    cur = await db.execute("DELETE FROM subscriptions WHERE id = ?", (subscription_id,))
+    await db.commit()
+    return cur.rowcount > 0
+
