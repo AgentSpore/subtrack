@@ -14,6 +14,7 @@ from extractor import (
     init_db, import_emails, list_subscriptions,
     get_spending_summary, list_alerts, mark_alert_read,
     delete_subscription, list_upcoming, update_subscription,
+    get_analytics,
 )
 
 DB_PATH = "subtrack.db"
@@ -37,7 +38,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="SubTrack",
     description="AI-powered subscription tracker. Paste billing emails, get a full picture of your recurring spend.",
-    version="0.5.0",
+    version="0.6.0",
     lifespan=lifespan,
 )
 
@@ -57,6 +58,16 @@ async def index_subscriptions(
 ):
     return await list_subscriptions(app.state.db, status, category)
 
+
+
+
+@app.get("/subscriptions/analytics")
+async def subscription_analytics():
+    """
+    Aggregated analytics: total monthly/annual spend, breakdown by category,
+    active vs cancelled counts, most expensive subscription, avg cost.
+    """
+    return await get_analytics(app.state.db)
 
 @app.get("/subscriptions/upcoming", response_model=list[SubscriptionResponse])
 async def upcoming_subscriptions(days: int = Query(7, ge=1, le=90)):
