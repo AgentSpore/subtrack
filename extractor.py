@@ -430,3 +430,39 @@ async def get_analytics(db: aiosqlite.Connection) -> dict:
         "by_category": by_cat,
         "by_status": by_status,
     }
+
+
+async def create_subscription(db: aiosqlite.Connection, data: dict) -> dict:
+    """Manually create a subscription without email parsing."""
+    next_billing = data.get("next_billing") or _compute_next_billing(
+        data.get("last_billed"), data.get("billing_cycle", "monthly")
+    )
+    cur = await db.execute(
+        """INSERT INTO subscriptions
+           (service_name, amount, currency, billing_cycle, category, status,
+            detected_from, last_billed, next_billing, price_history)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (
+            data["service_name"],
+            data.get("amount", 0.0),
+            data.get("currency", "USD"),
+            data.get("billing_cycle", "monthly"),
+            data.get("category", "other"),
+            data.get("status", "active"),
+            "manual",
+            data.get("last_billed"),
+            next_billing,
+            "[]",
+        ),
+    )
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM subscriptions WHERE id = ?", (cur.lastrowid,))
+    return _sub_row(rows[0]) if rows else {}
+
+
+async def get_subscription(db: aiosqlite.Connection, subscription_id: int) -> dict | None:
+    """Get a single subscription by ID."""
+    rows = await db.execute_fetchall(
+        "SELECT * FROM subscriptions WHERE id = ?", (subscription_id,)
+    )
+    return _sub_row(rows[0]) if rows else None
