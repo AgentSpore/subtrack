@@ -328,3 +328,20 @@ async def delete_subscription(db: aiosqlite.Connection, subscription_id: int) ->
     await db.commit()
     return cur.rowcount > 0
 
+async def list_upcoming(db: aiosqlite.Connection, days: int = 7) -> list:
+    """Return subscriptions with next_billing within the next N days."""
+    from datetime import datetime, timedelta
+    today = datetime.utcnow().date()
+    cutoff = (today + timedelta(days=days)).isoformat()
+    today_str = today.isoformat()
+    rows = await db.execute_fetchall(
+        """SELECT * FROM subscriptions
+           WHERE next_billing IS NOT NULL
+             AND next_billing >= ?
+             AND next_billing <= ?
+             AND status = 'active'
+           ORDER BY next_billing ASC""",
+        (today_str, cutoff),
+    )
+    return [_sub_row(r) for r in rows]
+
