@@ -364,3 +364,69 @@ async def update_subscription(db: aiosqlite.Connection, subscription_id: int, up
     rows = await db.execute_fetchall("SELECT * FROM subscriptions WHERE id = ?", (subscription_id,))
     return _sub_row(rows[0]) if rows else None
 
+
+
+async def get_analytics(db: aiosqlite.Connection) -> dict:
+    """
+    Aggregated subscription analytics for dashboard:
+    - monthly/annual spend totals
+    - per-category breakdown
+    - active vs cancelled counts
+    - most expensive subscription
+    - avg cost per subscription
+    """
+    from datetime import datetime
+    rows = await db.execute_fetchall("SELECT * FROM subscriptions")
+    if not rows:
+        return {
+            "total_monthly_spend": 0.0,
+            "total_annual_spend": 0.0,
+            "active_count": 0,
+            "cancelled_count": 0,
+            "avg_monthly_cost": 0.0,
+            "most_expensive": None,
+            "by_category": {},
+            "by_status": {},
+        }
+
+    def to_monthly(amount: float, cycle: str) -> float:
+        if cycle == "yearly":
+            return round(amount / 12, 2)
+        elif cycle == "weekly":
+            return round(amount * 4.33, 2)
+        elif cycle == "quarterly":
+            return round(amount / 3, 2)
+        return amount  # monthly
+
+    total_monthly = 0.0
+    by_cat: dict[str, float] = {}
+    by_status: dict[str, int] = {}
+    most_expensive = None
+    most_expensive_monthly = 0.0
+
+    for r in rows:
+        sub = _sub_row(r)
+        monthly = to_monthly(sub.get("amount", 0), sub.get("billing_cycle", "monthly"))
+        status = sub.get("status", "unknown")
+        by_status[status] = by_status.get(status, 0) + 1
+        if status != "active":
+            continue
+        total_monthly += monthly
+        cat = sub.get("category") or "other"
+        by_cat[cat] = round(by_cat.get(cat, 0.0) + monthly, 2)
+        if monthly > most_expensive_monthly:
+            most_expensive_monthly = monthly
+            most_expensive = {"name": sub.get("name"), "monthly_cost": monthly,
+                              "billing_cycle": sub.get("billing_cycle")}
+
+    active = by_status.get("active", 0)
+    return {
+        "total_monthly_spend": round(total_monthly, 2),
+        "total_annual_spend": round(total_monthly * 12, 2),
+        "active_count": active,
+        "cancelled_count": by_status.get("cancelled", 0),
+        "avg_monthly_cost": round(total_monthly / active, 2) if active else 0.0,
+        "most_expensive": most_expensive,
+        "by_category": by_cat,
+        "by_status": by_status,
+    }
