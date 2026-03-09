@@ -345,3 +345,22 @@ async def list_upcoming(db: aiosqlite.Connection, days: int = 7) -> list:
     )
     return [_sub_row(r) for r in rows]
 
+async def update_subscription(db: aiosqlite.Connection, subscription_id: int, updates: dict) -> dict | None:
+    """Partially update a subscription (status, amount, billing_cycle, next_billing, category)."""
+    allowed = {"status", "amount", "billing_cycle", "next_billing", "category"}
+    fields = {k: v for k, v in updates.items() if k in allowed and v is not None}
+    if not fields:
+        # Return current row unchanged
+        rows = await db.execute_fetchall("SELECT * FROM subscriptions WHERE id = ?", (subscription_id,))
+        return _sub_row(rows[0]) if rows else None
+    set_clause = ", ".join(f"{k} = ?" for k in fields)
+    cur = await db.execute(
+        f"UPDATE subscriptions SET {set_clause} WHERE id = ?",
+        list(fields.values()) + [subscription_id],
+    )
+    await db.commit()
+    if cur.rowcount == 0:
+        return None
+    rows = await db.execute_fetchall("SELECT * FROM subscriptions WHERE id = ?", (subscription_id,))
+    return _sub_row(rows[0]) if rows else None
+
