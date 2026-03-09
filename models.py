@@ -66,3 +66,13 @@ class AlertResponse(BaseModel):
     new_value: str | None
     created_at: str
     is_read: bool
+
+class SubscriptionCreate(BaseModel):
+    service_name: str = Field(description="Service or vendor name")
+    amount: float = Field(ge=0)
+    currency: str = Field(default="USD", max_length=3)
+    billing_cycle: BillingCycle = BillingCycle.monthly
+    category: Category = Category.other
+    status: SubStatus = SubStatus.active
+    last_billed: str | None = Field(default=None, description="ISO date YYYY-MM-DD")
+    next_billing: str | None = Field(default=None, description="ISO date YYYY-MM-DD")
