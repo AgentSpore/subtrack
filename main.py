@@ -9,12 +9,12 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from models import EmailImport, SubscriptionResponse, SpendingSummary, AlertResponse
+from models import EmailImport, SubscriptionCreate, SubscriptionResponse, SpendingSummary, AlertResponse
 from extractor import (
     init_db, import_emails, list_subscriptions,
     get_spending_summary, list_alerts, mark_alert_read,
     delete_subscription, list_upcoming, update_subscription,
-    get_analytics,
+    get_analytics, create_subscription, get_subscription,
 )
 
 DB_PATH = "subtrack.db"
@@ -38,9 +38,25 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="SubTrack",
     description="AI-powered subscription tracker. Paste billing emails, get a full picture of your recurring spend.",
-    version="0.6.0",
+    version="0.7.0",
     lifespan=lifespan,
 )
+
+
+
+@app.post("/subscriptions", response_model=SubscriptionResponse, status_code=201)
+async def create_sub(body: SubscriptionCreate):
+    """Manually add a subscription (without parsing a billing email)."""
+    return await create_subscription(app.state.db, body.model_dump())
+
+
+@app.get("/subscriptions/{subscription_id}", response_model=SubscriptionResponse)
+async def get_sub(subscription_id: int):
+    """Get a single subscription by ID."""
+    sub = await get_subscription(app.state.db, subscription_id)
+    if not sub:
+        raise HTTPException(404, "Subscription not found")
+    return sub
 
 
 @app.post("/subscriptions/import", response_model=list[SubscriptionResponse])
